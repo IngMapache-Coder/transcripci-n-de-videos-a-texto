@@ -1,4 +1,3 @@
-# .github/workflows/build-exe.yml
 name: Build EXE
 
 on:
@@ -32,6 +31,7 @@ jobs:
           --collect-all ctranslate2
           --collect-all faster_whisper
           --collect-data imageio_ffmpeg
+          --collect-all nvidia
           transcribir.py
 
       - name: Upload EXE artifact
