@@ -2,6 +2,7 @@
 
 import math
 import os
+import sys
 import subprocess
 import tempfile
 import wave
@@ -13,11 +14,63 @@ from tkinter.scrolledtext import ScrolledText
 import tkinter as tk
 
 
+def _preparar_librerias_cuda():
+    carpetas_candidatas = []
+
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base = sys._MEIPASS
+        carpetas_candidatas.append(os.path.join(base, "nvidia", "cublas", "bin"))
+        carpetas_candidatas.append(os.path.join(base, "nvidia", "cudnn", "bin"))
+    else:
+        try:
+            import nvidia.cublas
+            carpetas_candidatas.append(os.path.join(os.path.dirname(nvidia.cublas.__file__), "bin"))
+        except ImportError:
+            pass
+        try:
+            import nvidia.cudnn
+            carpetas_candidatas.append(os.path.join(os.path.dirname(nvidia.cudnn.__file__), "bin"))
+        except ImportError:
+            pass
+
+    for carpeta in carpetas_candidatas:
+        if os.path.isdir(carpeta):
+            try:
+                os.add_dll_directory(carpeta)
+            except (AttributeError, OSError):
+                pass
+            os.environ["PATH"] = carpeta + os.pathsep + os.environ.get("PATH", "")
+
+
+_preparar_librerias_cuda()
+
+
 @dataclass
 class Segmento:
     inicio: float
     fin: float
     texto: str
+
+
+def detectar_gpu_potente(vram_minima_mb=4000):
+    try:
+        resultado = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,name", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if resultado.returncode != 0 or not resultado.stdout.strip():
+            return False, None, 0
+        linea = resultado.stdout.strip().splitlines()[0]
+        partes = [p.strip() for p in linea.split(",")]
+        vram_mb = int(partes[0])
+        nombre_gpu = partes[1] if len(partes) > 1 else "GPU desconocida"
+        return vram_mb >= vram_minima_mb, nombre_gpu, vram_mb
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, IndexError):
+        return False, None, 0
+    except Exception:
+        return False, None, 0
 
 
 class TranscripcionApp:
@@ -290,15 +343,33 @@ def transcribir_video_con_callback(
 
     from faster_whisper import WhisperModel
     import imageio_ffmpeg
+    import ctranslate2
 
     nombre_base = os.path.splitext(os.path.basename(video_path))[0]
     salida_dir = salida_dir or os.path.dirname(os.path.abspath(video_path))
     os.makedirs(salida_dir, exist_ok=True)
 
+    try:
+        cuda_disponible = ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        cuda_disponible = False
+
+    gpu_es_potente, nombre_gpu, vram_mb = detectar_gpu_potente(vram_minima_mb=4000)
+    usar_gpu = cuda_disponible and gpu_es_potente
+
+    dispositivo = "cuda" if usar_gpu else "cpu"
+    tipo_computo = "float16" if usar_gpu else "int8"
+
     if log_callback:
         log_callback("🧠 Modelo: large-v3", "success")
-        log_callback("💻 Dispositivo: CPU", "info")
-        log_callback("⏱️ Nota: Este proceso puede tomar varias horas para videos largos", "warning")
+        if usar_gpu:
+            log_callback(f"🎮 GPU detectada: {nombre_gpu} ({vram_mb} MB VRAM) — usando aceleración CUDA", "success")
+        elif cuda_disponible and not gpu_es_potente:
+            log_callback(f"⚠️ Se detectó GPU pero con poca memoria de video ({vram_mb} MB) — se usará CPU por seguridad", "warning")
+            log_callback("⏱️ Nota: sin una GPU adecuada este proceso puede tomar varias horas para videos largos", "warning")
+        else:
+            log_callback("💻 No se detectó GPU NVIDIA compatible — usando CPU", "info")
+            log_callback("⏱️ Nota: sin GPU este proceso puede tomar varias horas para videos largos", "warning")
         log_callback("Preparando ffmpeg embebido...", "info")
     
     try:
@@ -307,7 +378,7 @@ def transcribir_video_con_callback(
         raise RuntimeError(f"Error al obtener ffmpeg: {e}")
 
     if log_callback:
-        log_callback("Cargando modelo Whisper 'large-v3' en CPU... (puede tardar varios minutos)", "info")
+        log_callback(f"Cargando modelo Whisper 'large-v3' en {dispositivo.upper()}... (puede tardar varios minutos)", "info")
     
     if estado_callback:
         estado_callback("Cargando modelo")
@@ -315,7 +386,19 @@ def transcribir_video_con_callback(
     if cancelar_check and cancelar_check():
         raise InterruptedError("Proceso cancelado por el usuario")
     
-    modelo = WhisperModel("large-v3", device="cpu", compute_type="int8")
+    try:
+        modelo = WhisperModel("large-v3", device=dispositivo, compute_type=tipo_computo)
+    except Exception as e:
+        if dispositivo == "cuda":
+            if log_callback:
+                log_callback(f"⚠️ No se pudo inicializar la GPU ({e}) — cambiando a CPU automáticamente", "warning")
+            dispositivo = "cpu"
+            tipo_computo = "int8"
+            if estado_callback:
+                estado_callback("Cargando modelo en CPU (respaldo)")
+            modelo = WhisperModel("large-v3", device=dispositivo, compute_type=tipo_computo)
+        else:
+            raise
 
     with tempfile.TemporaryDirectory() as tmp:
         audio_completo = os.path.join(tmp, "audio.wav")
