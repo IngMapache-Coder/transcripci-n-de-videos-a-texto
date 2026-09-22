@@ -1,3 +1,5 @@
-faster-whisper>=1.0.0
-imageio-ffmpeg>=0.5.0
 numpy>=1.24.0
+faster-whisper
+imageio-ffmpeg
+nvidia-cublas-cu12==12.4.5.8
+nvidia-cudnn-cu12==9.5.1.17
